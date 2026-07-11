@@ -1,11 +1,3 @@
-// api/sync-dashboard.js
-// Corre automático vía Vercel Cron (ver vercel.json) y/o GitHub Actions.
-// También puedes llamarlo a mano visitando la URL una vez desplegado.
-
-const MONTH_ABBR_ES = ['ene','feb','mar','abr','may','jun','jul','ago','sep','oct','nov','dic'];
-const PERIOD_COUNT = 12;
-const INVENTORY_PAGE_CAP = 10;
-
 const SHOP = process.env.SHOP_DOMAIN;
 const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
 const CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
@@ -34,14 +26,61 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-async function adminFetch(query, variables, token) {
+async function adminFetch(query, variables, token, attempt = 1) {
+  const MAX_ATTEMPTS = 5;
+
   const res = await fetch(`https://${SHOP}/admin/api/${API_VERSION}/graphql.json`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': token },
     body: JSON.stringify({ query, variables }),
   });
+
+  // Manejo explícito de rate limit por HTTP 429
+  if (res.status === 429) {
+    if (attempt >= MAX_ATTEMPTS) {
+      const bodyText = await res.text().catch(() => '');
+      throw new Error(`Rate limited (HTTP 429) tras ${attempt} intentos. Body: ${bodyText}`);
+    }
+
+    const retryAfterHeader = res.headers.get('Retry-After');
+    const delayMs = retryAfterHeader
+      ? parseInt(retryAfterHeader, 10) * 1000
+      : 2000 * attempt;
+
+    console.warn(
+      `Rate limited (HTTP 429) en adminFetch (intento ${attempt}). ` +
+      `Reintentando en ${delayMs}ms...`
+    );
+    await sleep(delayMs);
+    return adminFetch(query, variables, token, attempt + 1);
+  }
+
+  // Si la respuesta no es OK y no es 429, devolvemos error detallado
+  if (!res.ok) {
+    const bodyText = await res.text().catch(() => '');
+    throw new Error(`HTTP ${res.status} en Admin API: ${bodyText}`);
+  }
+
   const json = await res.json();
-  if (json.errors?.length) throw new Error(json.errors.map((e) => e.message).join(', '));
+
+  // Manejo de errores GraphQL (incluyendo posibles "THROTTLED")
+  if (json.errors?.length) {
+    const messages = json.errors.map((e) => e.message || JSON.stringify(e)).join(', ');
+    const isRate = /rate limit|throttl/i.test(messages);
+
+    if (isRate && attempt < MAX_ATTEMPTS) {
+      const delayMs = 2000 * attempt;
+      console.warn(
+        `Rate limited (GraphQL errors THROTTLED) en adminFetch (intento ${attempt}). ` +
+        `Reintentando en ${delayMs}ms...`
+      );
+      await sleep(delayMs);
+      return adminFetch(query, variables, token, attempt + 1);
+    }
+
+    throw new Error(messages);
+  }
+
   return json.data;
 }
 
@@ -60,30 +99,40 @@ async function getAccessToken() {
   return data.access_token;
 }
 
-// Endurecido: 6 intentos (antes 4) y backoff más agresivo (2s * intento, antes 1.3s),
-// más tolerancia general porque el cron real puede coincidir con otras llamadas
-// (dashboards, apps, pruebas manuales) consumiendo el mismo bucket de rate limit.
+// Ejecuta una query ShopifyQL y devuelve { columns, rows }
+// Ahora el manejo de rate limit lo hace adminFetch con reintentos.
 async function runShopifyQL(ql, token) {
-  const MAX_ATTEMPTS = 6;
-  let lastErr = null;
-  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-    if (attempt > 0) await sleep(2000 * attempt);
-    try {
-      const data = await adminFetch(
-        `query($q: String!) { shopifyqlQuery(query: $q) { parseErrors tableData { columns { name } rows } } }`,
-        { q: ql },
-        token,
-      );
-      const result = data.shopifyqlQuery;
-      if (result.parseErrors?.length) throw new Error(result.parseErrors.join(', '));
-      return { columns: result.tableData.columns.map((c) => c.name), rows: result.tableData.rows };
-    } catch (err) {
-      lastErr = err;
-      const isRate = /rate limit|throttl/i.test(err.message);
-      if (!isRate) throw err;
-    }
+  const data = await adminFetch(
+    `query($q: String!) {
+      shopifyqlQuery(query: $q) {
+        parseErrors
+        tableData {
+          columns { name }
+          rows
+        }
+      }
+    }`,
+    { q: ql },
+    token,
+  );
+
+  const result = data.shopifyqlQuery;
+  if (!result) {
+    throw new Error('Respuesta inválida de shopifyqlQuery (sin payload).');
   }
-  throw lastErr || new Error('Rate limited.');
+
+  if (result.parseErrors?.length) {
+    // parseErrors suele ser una lista de objetos o strings; los unimos en texto
+    const msg = result.parseErrors
+      .map((e) => (typeof e === 'string' ? e : e.message || JSON.stringify(e)))
+      .join(', ');
+    throw new Error(`Error de parseo ShopifyQL: ${msg}`);
+  }
+
+  const columns = (result.tableData?.columns || []).map((c) => c.name);
+  const rows = result.tableData?.rows || [];
+
+  return { columns, rows };
 }
 
 async function getCounts(token) {
@@ -104,7 +153,25 @@ async function getCounts(token) {
 async function getInventory(token) {
   const query = `query Inventory($after: String) {
     products(first: 250, after: $after) {
-      edges { node { title totalInventory featuredMedia { preview { image { url } } } variants(first: 100) { edges { node { price inventoryQuantity } } } } }
+      edges {
+        node {
+          title
+          totalInventory
+          featuredMedia {
+            preview {
+              image { url }
+            }
+          }
+          variants(first: 100) {
+            edges {
+              node {
+                price
+                inventoryQuantity
+              }
+            }
+          }
+        }
+      }
       pageInfo { hasNextPage endCursor }
     }
   }`;
@@ -186,7 +253,12 @@ async function buildPayload(token) {
     const ventas = toNumber(readM(row, 'ventas'));
     const utilidad = toNumber(readM(row, 'utilidad'));
     const margen = ventas > 0 ? (utilidad / ventas) * 100 : 0;
-    return { label: formatMonthLabel(monthKey), ventas: Math.round(ventas * 100) / 100, utilidad: Math.round(utilidad * 100) / 100, margen: Math.round(margen * 10) / 10 };
+    return {
+      label: formatMonthLabel(monthKey),
+      ventas: Math.round(ventas * 100) / 100,
+      utilidad: Math.round(utilidad * 100) / 100,
+      margen: Math.round(margen * 10) / 10,
+    };
   });
   await sleep(500);
 
@@ -251,11 +323,28 @@ async function buildPayload(token) {
 
 async function writeMetafield(token, shopId, payload) {
   const data = await adminFetch(
-    `mutation($mf: [MetafieldsSetInput!]!) { metafieldsSet(metafields: $mf) { metafields { id key } userErrors { field message } } }`,
-    { mf: [{ ownerId: shopId, namespace: 'custom', key: 'dashboard_json', type: 'json', value: JSON.stringify(payload) }] },
+    `mutation($mf: [MetafieldsSetInput!]!) {
+      metafieldsSet(metafields: $mf) {
+        metafields { id key }
+        userErrors { field message }
+      }
+    }`,
+    {
+      mf: [
+        {
+          ownerId: shopId,
+          namespace: 'custom',
+          key: 'dashboard_json',
+          type: 'json',
+          value: JSON.stringify(payload),
+        },
+      ],
+    },
     token,
   );
-  if (data.metafieldsSet.userErrors?.length) throw new Error(JSON.stringify(data.metafieldsSet.userErrors));
+  if (data.metafieldsSet.userErrors?.length) {
+    throw new Error(JSON.stringify(data.metafieldsSet.userErrors));
+  }
   return data.metafieldsSet.metafields;
 }
 
