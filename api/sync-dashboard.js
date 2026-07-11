@@ -1,3 +1,11 @@
+// api/sync-dashboard.js
+// Corre automático vía Vercel Cron (ver vercel.json) y/o GitHub Actions.
+// También puedes llamarlo a mano visitando la URL una vez desplegado.
+
+const MONTH_ABBR_ES = ['ene','feb','mar','abr','may','jun','jul','ago','sep','oct','nov','dic'];
+const PERIOD_COUNT = 12;
+const INVENTORY_PAGE_CAP = 10;
+
 const SHOP = process.env.SHOP_DOMAIN;
 const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
 const CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
