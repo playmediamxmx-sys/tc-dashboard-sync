@@ -1,5 +1,5 @@
 // api/sync-dashboard.js
-// Corre automático vía Vercel Cron (ver vercel.json).
+// Corre automático vía Vercel Cron (ver vercel.json) y/o GitHub Actions.
 // También puedes llamarlo a mano visitando la URL una vez desplegado.
 
 const MONTH_ABBR_ES = ['ene','feb','mar','abr','may','jun','jul','ago','sep','oct','nov','dic'];
@@ -30,6 +30,10 @@ function cellReader(columns) {
   return (row, name) => (Array.isArray(row) ? row[idx.get(name)] : row?.[name]);
 }
 
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 async function adminFetch(query, variables, token) {
   const res = await fetch(`https://${SHOP}/admin/api/${API_VERSION}/graphql.json`, {
     method: 'POST',
@@ -56,10 +60,14 @@ async function getAccessToken() {
   return data.access_token;
 }
 
+// Endurecido: 6 intentos (antes 4) y backoff más agresivo (2s * intento, antes 1.3s),
+// más tolerancia general porque el cron real puede coincidir con otras llamadas
+// (dashboards, apps, pruebas manuales) consumiendo el mismo bucket de rate limit.
 async function runShopifyQL(ql, token) {
+  const MAX_ATTEMPTS = 6;
   let lastErr = null;
-  for (let attempt = 0; attempt < 4; attempt++) {
-    if (attempt > 0) await new Promise((r) => setTimeout(r, 1300 * attempt));
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    if (attempt > 0) await sleep(2000 * attempt);
     try {
       const data = await adminFetch(
         `query($q: String!) { shopifyqlQuery(query: $q) { parseErrors tableData { columns { name } rows } } }`,
@@ -79,15 +87,17 @@ async function runShopifyQL(ql, token) {
 }
 
 async function getCounts(token) {
-  const [o, p, c] = await Promise.all([
-    adminFetch(`query { ordersCount(limit: null) { count } }`, {}, token),
-    adminFetch(`query { productsCount(limit: null) { count } }`, {}, token),
-    adminFetch(`query { customersCount(limit: null) { count } }`, {}, token),
-  ]);
+  // Antes: Promise.all (3 llamadas simultáneas). Ahora: secuencial con pausa breve
+  // entre cada una, para no golpear el rate limit con ráfagas concurrentes.
+  const orders = await adminFetch(`query { ordersCount(limit: null) { count } }`, {}, token);
+  await sleep(300);
+  const products = await adminFetch(`query { productsCount(limit: null) { count } }`, {}, token);
+  await sleep(300);
+  const customers = await adminFetch(`query { customersCount(limit: null) { count } }`, {}, token);
   return {
-    orders: toNumber(o.ordersCount?.count),
-    products: toNumber(p.productsCount?.count),
-    customers: toNumber(c.customersCount?.count),
+    orders: toNumber(orders.ordersCount?.count),
+    products: toNumber(products.productsCount?.count),
+    customers: toNumber(customers.customersCount?.count),
   };
 }
 
@@ -119,8 +129,10 @@ async function getInventory(token) {
     }
     pages += 1;
     const pageInfo = data.products?.pageInfo;
-    if (pageInfo?.hasNextPage) after = pageInfo.endCursor;
-    else break;
+    if (pageInfo?.hasNextPage) {
+      after = pageInfo.endCursor;
+      await sleep(300); // pausa entre páginas para no ráfaguear
+    } else break;
   }
   const topStock = stockList.sort((a, b) => b.stock - a.stock).slice(0, 5);
   return { variantsWithStock, totalValue, topStock };
@@ -153,15 +165,19 @@ async function buildPayload(token) {
   const shopData = await adminFetch(`query { shop { id currencyCode } }`, {}, token);
   const currency = shopData.shop?.currencyCode || 'MXN';
   const shopId = shopData.shop?.id;
+  await sleep(300);
 
   const counts = await getCounts(token);
+  await sleep(300);
   const inventory = await getInventory(token);
+  await sleep(300);
 
   const { columns: sc, rows: sr } = await runShopifyQL(TOTAL_SALES_QUERY, token);
   const readSales = cellReader(sc);
   const totalSales = sr.length ? toNumber(readSales(sr[0], 'gross_sales')) : 0;
   const totalProfit = sr.length ? toNumber(readSales(sr[0], 'gross_profit')) : 0;
   const avgMargin = totalSales > 0 ? (totalProfit / totalSales) * 100 : 0;
+  await sleep(500);
 
   const { columns: mc, rows: mr } = await runShopifyQL(MONTHLY_QUERY, token);
   const readM = cellReader(mc);
@@ -172,6 +188,7 @@ async function buildPayload(token) {
     const margen = ventas > 0 ? (utilidad / ventas) * 100 : 0;
     return { label: formatMonthLabel(monthKey), ventas: Math.round(ventas * 100) / 100, utilidad: Math.round(utilidad * 100) / 100, margen: Math.round(margen * 10) / 10 };
   });
+  await sleep(500);
 
   const { columns: pc, rows: pr } = await runShopifyQL(TOP_PRODUCTS_QUERY, token);
   const readP = cellReader(pc);
@@ -180,6 +197,7 @@ async function buildPayload(token) {
     pieces: toNumber(readP(row, 'net_items_sold')),
     sales: Math.round(toNumber(readP(row, 'gross_sales')) * 100) / 100,
   }));
+  await sleep(500);
 
   const { columns: cc, rows: cr } = await runShopifyQL(TOP_CUSTOMERS_QUERY, token);
   const readC = cellReader(cc);
@@ -188,6 +206,7 @@ async function buildPayload(token) {
     orders: toNumber(readC(row, 'orders')),
     total: Math.round(toNumber(readC(row, 'gross_sales')) * 100) / 100,
   }));
+  await sleep(500);
 
   const { cohorts, maxSales } = await getCohorts(token);
   const cohortRows = cohorts.map((c) => {
@@ -241,7 +260,7 @@ async function writeMetafield(token, shopId, payload) {
 }
 
 export default async function handler(req, res) {
-  // Protege el endpoint: solo Vercel Cron o tú mismo con el secret pueden llamarlo
+  // Protege el endpoint: solo Vercel Cron, GitHub Actions, o tú mismo con el secret pueden llamarlo
   const auth = req.headers['authorization'];
   if (process.env.CRON_SECRET && auth !== `Bearer ${process.env.CRON_SECRET}`) {
     return res.status(401).json({ error: 'No autorizado' });
