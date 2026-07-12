@@ -5,6 +5,8 @@
 const MONTH_ABBR_ES = ['ene','feb','mar','abr','may','jun','jul','ago','sep','oct','nov','dic'];
 const PERIOD_COUNT = 12;
 const INVENTORY_PAGE_CAP = 10;
+const QL_GAP_MS = 4000;   // pausa entre queries ShopifyQL (Analytics: límite estricto)
+const QL_BACKOFF_MS = 5000; // base de reintento cuando ShopifyQL regresa THROTTLED
 
 const SHOP = process.env.SHOP_DOMAIN;
 const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
@@ -53,7 +55,7 @@ async function adminFetch(query, variables, token, attempt = 1) {
     const retryAfterHeader = res.headers.get('Retry-After');
     const delayMs = retryAfterHeader
       ? parseInt(retryAfterHeader, 10) * 1000
-      : 2000 * attempt;
+      : QL_BACKOFF_MS * attempt;
 
     console.warn(
       `Rate limited (HTTP 429) en adminFetch (intento ${attempt}). ` +
@@ -77,7 +79,7 @@ async function adminFetch(query, variables, token, attempt = 1) {
     const isRate = /rate limit|throttl/i.test(messages);
 
     if (isRate && attempt < MAX_ATTEMPTS) {
-      const delayMs = 2000 * attempt;
+      const delayMs = QL_BACKOFF_MS * attempt;
       console.warn(
         `Rate limited (GraphQL errors THROTTLED) en adminFetch (intento ${attempt}). ` +
         `Reintentando en ${delayMs}ms...`
@@ -252,7 +254,7 @@ async function buildPayload(token) {
   const totalSales = sr.length ? toNumber(readSales(sr[0], 'gross_sales')) : 0;
   const totalProfit = sr.length ? toNumber(readSales(sr[0], 'gross_profit')) : 0;
   const avgMargin = totalSales > 0 ? (totalProfit / totalSales) * 100 : 0;
-  await sleep(500);
+  await sleep(QL_GAP_MS);
 
   const { columns: mc, rows: mr } = await runShopifyQL(MONTHLY_QUERY, token);
   const readM = cellReader(mc);
@@ -268,7 +270,7 @@ async function buildPayload(token) {
       margen: Math.round(margen * 10) / 10,
     };
   });
-  await sleep(500);
+  await sleep(QL_GAP_MS);
 
   const { columns: pc, rows: pr } = await runShopifyQL(TOP_PRODUCTS_QUERY, token);
   const readP = cellReader(pc);
@@ -277,7 +279,7 @@ async function buildPayload(token) {
     pieces: toNumber(readP(row, 'net_items_sold')),
     sales: Math.round(toNumber(readP(row, 'gross_sales')) * 100) / 100,
   }));
-  await sleep(500);
+  await sleep(QL_GAP_MS);
 
   const { columns: cc, rows: cr } = await runShopifyQL(TOP_CUSTOMERS_QUERY, token);
   const readC = cellReader(cc);
@@ -286,7 +288,7 @@ async function buildPayload(token) {
     orders: toNumber(readC(row, 'orders')),
     total: Math.round(toNumber(readC(row, 'gross_sales')) * 100) / 100,
   }));
-  await sleep(500);
+  await sleep(QL_GAP_MS);
 
   const { cohorts, maxSales } = await getCohorts(token);
   const cohortRows = cohorts.map((c) => {
@@ -356,6 +358,23 @@ async function writeMetafield(token, shopId, payload) {
   return data.metafieldsSet.metafields;
 }
 
+const MIN_INTERVAL_MS = 3 * 60 * 1000; // no re-sincronizar si hace <3 min
+
+async function recentlySynced(token) {
+  try {
+    const data = await adminFetch(
+      `query { shop { metafield(namespace: "custom", key: "dashboard_json") { updatedAt } } }`,
+      {},
+      token,
+    );
+    const updatedAt = data?.shop?.metafield?.updatedAt;
+    if (!updatedAt) return false;
+    return Date.now() - new Date(updatedAt).getTime() < MIN_INTERVAL_MS;
+  } catch {
+    return false;
+  }
+}
+
 export default async function handler(req, res) {
   // Protege el endpoint: solo Vercel Cron, GitHub Actions, o tú mismo con el secret pueden llamarlo
   const auth = req.headers['authorization'];
@@ -365,6 +384,13 @@ export default async function handler(req, res) {
 
   try {
     const token = await getAccessToken();
+
+    // ¿Publicado hace menos de 3 min? No quemar el rate limit de ShopifyQL.
+    if (req.query?.force !== '1' && (await recentlySynced(token))) {
+      return res
+        .status(200)
+        .json({ ok: true, skipped: true, reason: 'Sincronizado hace <3 min' });
+    }
     const { shopId, payload } = await buildPayload(token);
     await writeMetafield(token, shopId, payload);
     return res.status(200).json({ ok: true, updated_at: payload.updated_at });
