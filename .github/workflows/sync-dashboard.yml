@@ -1,0 +1,24 @@
+# .github/workflows/sync-dashboard.yml
+name: Sync Dashboard TC
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'   # cada 30 min (GitHub puede tener drift de unos minutos en horas pico)
+  workflow_dispatch: {}       # botón manual en Actions tab
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Llamar endpoint de sync
+        run: |
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X GET \
+            "https://tc-dashboard-sync.vercel.app/api/sync-dashboard" \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}")
+          BODY=$(echo "$RESPONSE" | head -n -1)
+          CODE=$(echo "$RESPONSE" | tail -n1)
+          echo "HTTP $CODE — $BODY"
+          if [ "$CODE" -ne 200 ]; then
+            echo "::error::Sync falló con código $CODE"
+            exit 1
+          fi
