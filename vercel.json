@@ -1,4 +1,12 @@
 {
+  "functions": {
+    "api/sync-dashboard.js": {
+      "maxDuration": 300
+    },
+    "api/webhooks-sync.js": {
+      "maxDuration": 300
+    }
+  },
   "crons": [
     {
       "path": "/api/sync-dashboard",
