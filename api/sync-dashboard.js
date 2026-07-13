@@ -27,6 +27,19 @@ function formatMonthLabel(monthValue) {
   return `${MONTH_ABBR_ES[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
 }
 
+// Genera las últimas N claves de mes en formato "YYYY-MM", terminando en el mes actual (UTC).
+// Se usa para forzar 12 meses completos en el payload, aunque ShopifyQL solo
+// haya regresado filas para los meses con ventas reales.
+function lastNMonthsKeys(n) {
+  const keys = [];
+  const now = new Date();
+  for (let i = n - 1; i >= 0; i--) {
+    const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - i, 1));
+    keys.push(d.toISOString().slice(0, 7)); // "YYYY-MM"
+  }
+  return keys;
+}
+
 function cellReader(columns) {
   const idx = new Map(columns.map((c, i) => [c, i]));
   return (row, name) => (Array.isArray(row) ? row[idx.get(name)] : row?.[name]);
@@ -256,21 +269,34 @@ async function buildPayload(token) {
   const avgMargin = totalSales > 0 ? (totalProfit / totalSales) * 100 : 0;
   await sleep(QL_GAP_MS);
 
+  // ===== MONTHLY: fix aplicado =====
+  // Antes: `monthly` solo incluía los meses que ShopifyQL regresaba con ventas,
+  // así que con 1 mes de ventas reales el payload traía 1 solo punto.
+  // Ahora: se generan siempre los últimos 12 meses reales (lastNMonthsKeys),
+  // y se rellenan con {ventas:0, utilidad:0} los meses sin filas en ShopifyQL.
+  // Así el payload siempre trae 12 meses, con ceros donde aún no hay ventas.
   const { columns: mc, rows: mr } = await runShopifyQL(MONTHLY_QUERY, token);
   const readM = cellReader(mc);
-  const monthly = mr.map((row) => {
-    const monthKey = String(readM(row, 'month') ?? '');
-    const ventas = toNumber(readM(row, 'ventas'));
-    const utilidad = toNumber(readM(row, 'utilidad'));
-    const margen = ventas > 0 ? (utilidad / ventas) * 100 : 0;
+  const monthlyMap = new Map();
+  for (const row of mr) {
+    const monthKey = String(readM(row, 'month') ?? '').slice(0, 7);
+    monthlyMap.set(monthKey, {
+      ventas: toNumber(readM(row, 'ventas')),
+      utilidad: toNumber(readM(row, 'utilidad')),
+    });
+  }
+  const monthly = lastNMonthsKeys(12).map((key) => {
+    const entry = monthlyMap.get(key) || { ventas: 0, utilidad: 0 };
+    const margen = entry.ventas > 0 ? (entry.utilidad / entry.ventas) * 100 : 0;
     return {
-      label: formatMonthLabel(monthKey),
-      ventas: Math.round(ventas * 100) / 100,
-      utilidad: Math.round(utilidad * 100) / 100,
+      label: formatMonthLabel(key + '-01'),
+      ventas: Math.round(entry.ventas * 100) / 100,
+      utilidad: Math.round(entry.utilidad * 100) / 100,
       margen: Math.round(margen * 10) / 10,
     };
   });
   await sleep(QL_GAP_MS);
+  // ===== fin fix MONTHLY =====
 
   const { columns: pc, rows: pr } = await runShopifyQL(TOP_PRODUCTS_QUERY, token);
   const readP = cellReader(pc);
