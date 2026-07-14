@@ -3,7 +3,7 @@
     "api/sync-dashboard.js": {
       "maxDuration": 300
     },
-    "api/webhooks-sync.js": {
+    "api/inventario.js": {
       "maxDuration": 300
     }
   },
