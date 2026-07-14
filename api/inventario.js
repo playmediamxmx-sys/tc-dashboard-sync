@@ -14,6 +14,8 @@
 // Requiere en la app: scopes read_inventory, write_inventory, read_locations
 // (ya confirmados). Requiere maxDuration:300 en vercel.json (ya lo tienes).
 
+import { randomUUID } from 'crypto';
+
 const SHOP = process.env.SHOP_DOMAIN;
 const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
 const CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
@@ -199,32 +201,59 @@ async function getAvailableQuantity(token, inventoryItemId, locationId) {
   return available ? toNumber(available.quantity) : 0;
 }
 
-async function adjustInventory(token, inventoryItemId, locationId, delta, reason) {
+// Desde la API 2026-04, Shopify exige changeFromQuantity (compare-and-swap:
+// "espero que la cantidad actual sea X antes de ajustar") y una llave de
+// idempotencia (@idempotent) en cada llamada. Si otro operador ajustó el
+// mismo producto entre que leemos la cantidad y ajustamos, Shopify regresa
+// CHANGE_FROM_QUANTITY_STALE — reintentamos 1 vez con la cantidad fresca.
+async function adjustInventoryOnce(token, inventoryItemId, locationId, delta, reason, changeFromQuantity) {
+  const idempotencyKey = randomUUID();
   const data = await adminFetch(
-    `mutation($input: InventoryAdjustQuantitiesInput!) {
-      inventoryAdjustQuantities(input: $input) {
+    `mutation($input: InventoryAdjustQuantitiesInput!, $idempotencyKey: String!) {
+      inventoryAdjustQuantities(input: $input) @idempotent(key: $idempotencyKey) {
         inventoryAdjustmentGroup {
           changes { name delta quantityAfterChange }
         }
-        userErrors { field message }
+        userErrors { field message code }
       }
     }`,
     {
       input: {
         reason,
         name: 'available',
-        changes: [{ delta, inventoryItemId, locationId }],
+        changes: [{ delta, changeFromQuantity, inventoryItemId, locationId }],
       },
+      idempotencyKey,
     },
     token,
   );
 
   const errors = data.inventoryAdjustQuantities?.userErrors;
-  if (errors?.length) throw new Error(errors.map((e) => e.message).join(', '));
+  if (errors?.length) {
+    const isStale = errors.some((e) => /STALE/i.test(e.code || '') || /stale/i.test(e.message || ''));
+    if (isStale) {
+      const err = new Error('CHANGE_FROM_QUANTITY_STALE');
+      err.isStale = true;
+      throw err;
+    }
+    throw new Error(errors.map((e) => e.message).join(', '));
+  }
 
   const changes = data.inventoryAdjustQuantities?.inventoryAdjustmentGroup?.changes || [];
   const change = changes.find((c) => c.name === 'available') || changes[0];
   return change ? toNumber(change.quantityAfterChange) : null;
+}
+
+async function adjustInventory(token, inventoryItemId, locationId, delta, reason) {
+  const currentQty = await getAvailableQuantity(token, inventoryItemId, locationId);
+  try {
+    return await adjustInventoryOnce(token, inventoryItemId, locationId, delta, reason, currentQty);
+  } catch (err) {
+    if (!err.isStale) throw err;
+    // Reintento único: alguien más ajustó el inventario justo en medio. Releemos y reintentamos.
+    const freshQty = await getAvailableQuantity(token, inventoryItemId, locationId);
+    return adjustInventoryOnce(token, inventoryItemId, locationId, delta, reason, freshQty);
+  }
 }
 
 // ── Historial centralizado: leer/escribir shop.metafields.custom.qr_movements
