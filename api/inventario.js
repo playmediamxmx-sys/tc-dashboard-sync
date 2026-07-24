@@ -4,6 +4,16 @@
 // metafield shop.metafields.custom.qr_movements. El token de Shopify vive
 // SOLO aquí — el Liquid nunca lo ve.
 //
+// ── CAMBIO v2 (corrige el toast "en total tienes 0") ──────────────────────
+// La mutación inventoryAdjustQuantities de la API 2026-04, cuando se usa con
+// changeFromQuantity (compare-and-swap), devuelve quantityAfterChange = 0 de
+// forma consistente en este flujo. Por eso el toast del front mostraba 0
+// aunque Shopify sí quedaba con el número correcto (al recargar se veía bien).
+// SOLUCIÓN: tras ajustar, se RELEE la cantidad real con getAvailableQuantity
+// (función que ya existía) y ESE es el available_after que se devuelve.
+// Es la fuente de verdad y elimina el 0 fantasma para el toast y el historial.
+// ──────────────────────────────────────────────────────────────────────────
+//
 // Reutiliza las mismas env vars que api/sync-dashboard.js:
 //   SHOP_DOMAIN, SHOPIFY_CLIENT_ID, SHOPIFY_CLIENT_SECRET
 // Y agrega dos nuevas, propias de este endpoint:
@@ -359,7 +369,16 @@ export default async function handler(req, res) {
 
       const delta = mode === 'entrada' ? qtyNum : -qtyNum;
       const reason = mode === 'entrada' ? 'restock' : 'correction';
-      const availableAfter = await adjustInventory(token, target.inventoryItemId, locationId, delta, reason);
+
+      // Ajuste real. NO confiamos en el quantityAfterChange que devuelve la
+      // mutación: en la API 2026-04 con compare-and-swap llega 0 de forma
+      // consistente en este flujo, y era la causa del "en total tienes 0".
+      await adjustInventory(token, target.inventoryItemId, locationId, delta, reason);
+
+      // Fuente de verdad: releemos la cantidad REAL disponible tras el ajuste.
+      // Esto es lo que ve el operador al recargar, y ahora también lo que
+      // muestra el toast en el momento.
+      const availableAfter = await getAvailableQuantity(token, target.inventoryItemId, locationId);
 
       const movement = {
         ts: new Date().toISOString(),
@@ -386,4 +405,3 @@ export default async function handler(req, res) {
     return res.status(500).json({ ok: false, error: err.message });
   }
 }
-
